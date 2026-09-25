@@ -16,15 +16,20 @@ class EvidenceGateway:
     def __init__(self, session: ClientSession, contracts: Contracts) -> None:
         self._session = session
         self._contracts = contracts
+        self._tool_names: list[str] | None = None
 
     async def list_tools(self) -> list[str]:
-        response = await self._session.list_tools()
-        return sorted(tool.name for tool in response.tools)
+        if self._tool_names is None:
+            response = await self._session.list_tools()
+            self._tool_names = sorted(tool.name for tool in response.tools)
+        return self._tool_names.copy()
 
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
         result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        # MCP Python SDKs expose this field as either ``is_error`` (current
+        # Pydantic model) or ``isError`` (older protocol-shaped model).
+        if getattr(result, "is_error", getattr(result, "isError", False)):
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
@@ -48,7 +53,17 @@ async def connect_gateway(
     headers = {"Authorization": f"Bearer {team_api_key}"}
     timeout = httpx2.Timeout(300.0, connect=30.0, write=30.0, pool=30.0)
     async with (
-        httpx2.AsyncClient(headers=headers, timeout=timeout) as http_client,
+        # MCP endpoint is configured explicitly.  Do not inherit a stale
+        # HTTP(S)_PROXY setting from the developer shell: it can make httpx
+        # fail even when the configured endpoint is directly reachable.
+        httpx2.AsyncClient(
+            headers=headers,
+            timeout=timeout,
+            trust_env=False,
+            # The competition gateway can briefly refuse a new TCP connection
+            # while a just-finished stream is being released.
+            transport=httpx2.AsyncHTTPTransport(retries=3),
+        ) as http_client,
         streamable_http_client(endpoint, http_client=http_client) as (read_stream, write_stream),
         ClientSession(read_stream, write_stream) as session,
     ):
